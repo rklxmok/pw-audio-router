@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <g transform="rotate(-30, 32, 32)">
+    <!-- Cable -->
+    <rect x="2" y="27" width="16" height="10" rx="3" fill="#ffffff"/>
+    <!-- Strain relief / grip -->
+    <rect x="14" y="25" width="8" height="14" rx="2" fill="#e0e0e0"/>
+    <!-- Barrel (main body) -->
+    <rect x="22" y="24" width="24" height="16" rx="2" fill="#ffffff"/>
+    <!-- Ring groove 1 -->
+    <rect x="30" y="24" width="2" height="16" fill="#cccccc"/>
+    <!-- Ring groove 2 -->
+    <rect x="38" y="24" width="2" height="16" fill="#cccccc"/>
+    <!-- Tip section -->
+    <polygon points="46,28 46,36 58,33 58,31" fill="#f0f0f0"/>
+    <!-- Tip point -->
+    <circle cx="58" cy="32" r="2.5" fill="#ffffff"/>
+    <!-- Shine highlight on barrel -->
+    <rect x="23" y="26" width="22" height="3" rx="1" fill="#ffffff" opacity="0.3"/>
+  </g>
+</svg>
