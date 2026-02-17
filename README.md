@@ -11,7 +11,7 @@ A lightweight Qt system tray app for routing application audio between PipeWire 
 
 ## Install
 
-### Arch Linux / Garuda
+### Arch Linux / Garuda / CachyOS / SteamOS
 
 ```bash
 sudo pacman -S python-pyqt6 pipewire
