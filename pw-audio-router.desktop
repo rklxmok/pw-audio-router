@@ -2,7 +2,7 @@
 Type=Application
 Name=PipeWire Audio Router
 Comment=Route application audio for screen sharing via PipeWire
-Exec=python3 /home/rkb/pw-audio-router/audio_router.py
+Exec=bash -c "python3 $HOME/pw-audio-router/pipewire-audio-router.py"
 Icon=audio-volume-high
 Terminal=false
 Categories=AudioVideo;Audio;Utility;

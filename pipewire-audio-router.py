@@ -252,7 +252,7 @@ class SystemTrayApp:
         self.menu.clear()
 
         # --- Route Audio submenu (sources) ---
-        source_menu = self.menu.addMenu("Route Audio")
+        source_menu = self.menu.addMenu("Route Audio    ")
         sources = self.pw.list_audio_sources()
         if sources:
             for src in sources:
@@ -271,7 +271,7 @@ class SystemTrayApp:
             no_src.setEnabled(False)
 
         # --- Route To submenu (destinations) ---
-        dest_menu = self.menu.addMenu("Route To")
+        dest_menu = self.menu.addMenu("Route To    ")
         destinations = self.pw.list_audio_destinations()
         if destinations:
             for dst in destinations:
