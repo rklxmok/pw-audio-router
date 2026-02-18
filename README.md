@@ -35,9 +35,11 @@ python3 pipewire-audio-router.py
 
 ### Install to applications menu & autostart
 
+Run the install script once after cloning. It writes the correct absolute
+path into the desktop files so autostart works reliably across all distros:
+
 ```bash
-cp pw-audio-router.desktop ~/.local/share/applications/
-cp pw-audio-router.desktop ~/.config/autostart/
+bash install.sh
 ```
 
 ### How it works
