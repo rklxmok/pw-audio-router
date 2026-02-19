@@ -7,7 +7,6 @@ import re
 import subprocess
 import sys
 
-from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -19,7 +18,6 @@ class PipeWireManager:
 
     def __init__(self):
         self._virtual_sink_id = None
-        self._active_links = []  # list of (output_port, input_port) tuples
         # Check if we already have a virtual sink from a previous session
         self._detect_existing_virtual_sink()
 
@@ -169,37 +167,45 @@ class PipeWireManager:
                 ["pw-link", source_port_name, dest_port_name],
                 capture_output=True, text=True, timeout=5,
             )
-            if result.returncode == 0 or "already linked" in result.stderr:
-                link = (source_port_name, dest_port_name)
-                if link not in self._active_links:
-                    self._active_links.append(link)
-                return True
-            return False
+            return result.returncode == 0 or "already linked" in result.stderr
         except subprocess.SubprocessError:
             return False
 
-    def destroy_link(self, source_port_name, dest_port_name):
-        """Destroy a pw-link between two ports."""
+    def destroy_link(self, link_id):
+        """Destroy a link by its PipeWire link ID."""
         try:
             subprocess.run(
-                ["pw-link", "-d", source_port_name, dest_port_name],
+                ["pw-link", "-d", str(link_id)],
                 capture_output=True, text=True, timeout=5,
             )
         except subprocess.SubprocessError:
             pass
-        link = (source_port_name, dest_port_name)
-        if link in self._active_links:
-            self._active_links.remove(link)
 
     def destroy_all_links(self):
-        """Destroy all links we created."""
-        for src, dst in list(self._active_links):
-            self.destroy_link(src, dst)
-        self._active_links.clear()
+        """Destroy all currently active links reported by PipeWire."""
+        for link in self.get_active_links():
+            self.destroy_link(link["link_id"])
 
     def get_active_links(self):
-        """Return a copy of the active links list."""
-        return list(self._active_links)
+        """Query PipeWire for all active links. Returns list of dicts with link_id, src, dst."""
+        try:
+            result = subprocess.run(
+                ["pw-link", "-l"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except subprocess.SubprocessError:
+            return []
+
+        links = []
+        for line in result.stdout.splitlines():
+            match = re.match(r'\s*(\d+)\s+(.+?)\s+->\s+(.+)', line)
+            if match:
+                links.append({
+                    "link_id": match.group(1),
+                    "src": match.group(2).strip(),
+                    "dst": match.group(3).strip(),
+                })
+        return links
 
     def route_source_to_destination(self, source_node, dest_node):
         """Route all audio channels from source to destination.
@@ -296,14 +302,13 @@ class SystemTrayApp:
         if links:
             header = self.menu.addAction("Active Routes:")
             header.setEnabled(False)
-            for src_port, dst_port in links:
-                # Shorten to node names for display
-                src_short = src_port.rsplit(":", 1)[0] if ":" in src_port else src_port
-                dst_short = dst_port.rsplit(":", 1)[0] if ":" in dst_port else dst_port
-                label = f"  {src_short} -> {dst_short}"
-                rm_action = self.menu.addAction(label + "  [x]")
+            for link in links:
+                src_short = link["src"].rsplit(":", 1)[0]
+                dst_short = link["dst"].rsplit(":", 1)[0]
+                label = f"  {src_short} -> {dst_short}  [x]"
+                rm_action = self.menu.addAction(label)
                 rm_action.triggered.connect(
-                    lambda checked, s=src_port, d=dst_port: self._on_remove_link(s, d)
+                    lambda checked, lid=link["link_id"]: self.pw.destroy_link(lid)
                 )
 
             self.menu.addSeparator()
@@ -364,9 +369,6 @@ class SystemTrayApp:
     @staticmethod
     def VIRTUAL_SINK_NAME_MATCH(name):
         return PipeWireManager.VIRTUAL_SINK_NAME.lower() in name.lower()
-
-    def _on_remove_link(self, src_port, dst_port):
-        self.pw.destroy_link(src_port, dst_port)
 
     def _on_stop_all(self):
         self.pw.destroy_all_links()
