@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 
+from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QAction, QCursor, QIcon
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -24,6 +25,7 @@ class PipeWireManager:
         self._original_default_source = None  # saved before swapping to virtual mic
         self._mic_passthrough_links = []  # (src, dst) pairs for real mic -> virtual mic
         self._tracked_ports = []  # list of link dicts we created
+        self._routing_rules = []  # list of {"src_name": ..., "dst_node": ...}
         # Check if we already have virtual nodes from a previous session
         self._detect_existing_virtual_sink()
         self._detect_existing_virtual_mic()
@@ -356,7 +358,14 @@ class PipeWireManager:
                 ["pw-link", str(source), str(dest)],
                 capture_output=True, text=True, timeout=5,
             )
-            if result.returncode == 0 or "already linked" in result.stderr:
+            # pw-link returns 0 on success.  When the link already exists
+            # it returns non-zero with "File exists" in stderr.
+            linked = (
+                result.returncode == 0
+                or "File exists" in result.stderr
+                or "already linked" in result.stderr
+            )
+            if linked:
                 entry = {
                     "src_id": str(source),
                     "dst_id": str(dest),
@@ -401,8 +410,31 @@ class PipeWireManager:
         self._tracked_ports.clear()
 
     def get_active_links(self):
-        """Return tracked links."""
+        """Return tracked links, pruning any whose ports no longer exist."""
+        self._cleanup_stale_links()
         return list(self._tracked_ports)
+
+    def _cleanup_stale_links(self):
+        """Remove tracked entries whose source ports no longer exist in PipeWire."""
+        if not self._tracked_ports:
+            return
+        try:
+            result = subprocess.run(
+                ["pw-link", "-o", "-I"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except subprocess.SubprocessError:
+            return
+
+        live_ids = set()
+        for line in result.stdout.splitlines():
+            m = re.match(r'\s*(\d+)\s+', line)
+            if m:
+                live_ids.add(m.group(1))
+
+        self._tracked_ports = [
+            t for t in self._tracked_ports if t["src_id"] in live_ids
+        ]
 
     def route_source_to_destination(self, source_node, dest_node):
         """Route all audio channels from source to destination.
@@ -423,6 +455,65 @@ class PipeWireManager:
                 success = False
         return success
 
+    # ------------------------------------------------------------------
+    # Sticky routing rules
+    # ------------------------------------------------------------------
+
+    def add_routing_rule(self, src_app_name, dest_node):
+        """Add a sticky rule: all streams from src_app_name -> dest_node."""
+        # Remove any existing rule for this app name
+        self._routing_rules = [
+            r for r in self._routing_rules if r["src_name"] != src_app_name
+        ]
+        self._routing_rules.append({
+            "src_name": src_app_name,
+            "dst_node": dest_node,
+        })
+
+    def remove_routing_rule(self, src_app_name):
+        """Remove a sticky rule for an app."""
+        self._routing_rules = [
+            r for r in self._routing_rules if r["src_name"] != src_app_name
+        ]
+
+    def clear_routing_rules(self):
+        """Remove all sticky routing rules."""
+        self._routing_rules.clear()
+
+    def get_routing_rules(self):
+        """Return active routing rules."""
+        return list(self._routing_rules)
+
+    def enforce_routing_rules(self):
+        """Scan for streams matching active rules and link any unlinked ones."""
+        if not self._routing_rules:
+            return
+
+        # Prune stale entries first so dead port IDs don't block re-routing
+        self._cleanup_stale_links()
+
+        sources = self.list_audio_sources()
+        tracked_src_ids = {t["src_id"] for t in self._tracked_ports}
+
+        for rule in self._routing_rules:
+            # Refresh destination ports (they may have new IDs too)
+            dst_node = self._find_node_ports("input", rule["dst_node"]["name"])
+            if not dst_node:
+                continue
+
+            # Find all source streams matching this app name
+            for src_node in sources:
+                if src_node["name"] != rule["src_name"]:
+                    continue
+
+                # Check if this stream's ports are already linked
+                src_ids = {p[0] for p in src_node["ports"]}
+                if src_ids & tracked_src_ids:
+                    continue  # already routed
+
+                # New stream found — link it
+                self.route_source_to_destination(src_node, dst_node)
+
 
 class SystemTrayApp:
     """Qt system tray application for PipeWire audio routing."""
@@ -434,8 +525,8 @@ class SystemTrayApp:
         self.pw = PipeWireManager()
 
         # Track user selections
-        self._selected_source = None  # node dict
-        self._selected_dest = None    # node dict
+        self._selected_source_name = None  # app name string
+        self._selected_dest = None         # node dict
 
         # Create tray icon
         self.tray = QSystemTrayIcon()
@@ -455,6 +546,11 @@ class SystemTrayApp:
         # forwards left-click / Activate.  Show the menu on any click so it
         # works everywhere.
         self.tray.activated.connect(self._on_tray_activated)
+
+        # Poll for new streams matching active routing rules
+        self._enforce_timer = QTimer()
+        self._enforce_timer.timeout.connect(self.pw.enforce_routing_rules)
+        self._enforce_timer.start(2000)  # every 2 seconds
 
         self.tray.show()
 
@@ -484,6 +580,17 @@ class SystemTrayApp:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _unique_source_names(sources):
+        """Return deduplicated list of app names from source nodes."""
+        seen = set()
+        names = []
+        for s in sources:
+            if s["name"] not in seen:
+                seen.add(s["name"])
+                names.append(s["name"])
+        return names
+
+    @staticmethod
     def _label_nodes(nodes):
         """Add display labels, numbering duplicates (e.g. 'Chromium #1')."""
         name_count = {}
@@ -500,29 +607,22 @@ class SystemTrayApp:
                 n["label"] = n["name"]
         return nodes
 
-    @staticmethod
-    def _same_node(a, b):
-        """Check if two node dicts refer to the same PipeWire node."""
-        if a is None or b is None:
-            return False
-        # Compare by port IDs for uniqueness
-        a_ids = {p[0] for p in a["ports"]}
-        b_ids = {p[0] for p in b["ports"]}
-        return bool(a_ids & b_ids)
-
     def _rebuild_menu(self):
         self.menu.clear()
 
         # --- Route Audio submenu (sources) ---
+        # Show each app name once; selecting it routes ALL its streams.
         source_menu = self.menu.addMenu("Route Audio    ")
-        sources = self._label_nodes(self.pw.list_audio_sources())
-        if sources:
-            for src in sources:
-                action = QAction(src["label"], self.menu)
+        sources = self.pw.list_audio_sources()
+        source_names = self._unique_source_names(sources)
+        active_rules = {r["src_name"] for r in self.pw.get_routing_rules()}
+        if source_names:
+            for name in source_names:
+                action = QAction(name, self.menu)
                 action.setCheckable(True)
-                action.setChecked(self._same_node(self._selected_source, src))
+                action.setChecked(name in active_rules)
                 action.triggered.connect(
-                    lambda checked, s=src: self._on_source_selected(s)
+                    lambda checked, n=name: self._on_source_selected(n)
                 )
                 source_menu.addAction(action)
         else:
@@ -536,7 +636,10 @@ class SystemTrayApp:
             for dst in destinations:
                 action = QAction(dst["label"], self.menu)
                 action.setCheckable(True)
-                action.setChecked(self._same_node(self._selected_dest, dst))
+                action.setChecked(
+                    self._selected_dest is not None
+                    and self._selected_dest["name"] == dst["name"]
+                )
                 action.triggered.connect(
                     lambda checked, d=dst: self._on_dest_selected(d)
                 )
@@ -557,17 +660,23 @@ class SystemTrayApp:
         self.menu.addSeparator()
 
         # --- Active Routes ---
+        # Group per-channel links into one display entry per app->dest pair
         links = self.pw.get_active_links()
-        if links:
+        route_groups = {}  # (src_app, dst_app) -> list of link dicts
+        for link in links:
+            src_app = link["src_name"].rsplit(":", 1)[0]
+            dst_app = link["dst_name"].rsplit(":", 1)[0]
+            key = (src_app, dst_app)
+            route_groups.setdefault(key, []).append(link)
+
+        if route_groups:
             header = self.menu.addAction("Active Routes:")
             header.setEnabled(False)
-            for link in links:
-                src_short = link["src_name"].rsplit(":", 1)[0]
-                dst_short = link["dst_name"].rsplit(":", 1)[0]
-                label = f"  {src_short} -> {dst_short}  [x]"
+            for (src_app, dst_app), group_links in route_groups.items():
+                label = f"  {src_app} -> {dst_app}  [x]"
                 rm_action = self.menu.addAction(label)
                 rm_action.triggered.connect(
-                    lambda checked, l=link: self.pw.destroy_link(l)
+                    lambda checked, ll=group_links: self._on_remove_link_group(ll)
                 )
 
             self.menu.addSeparator()
@@ -583,8 +692,8 @@ class SystemTrayApp:
     # Actions
     # ------------------------------------------------------------------
 
-    def _on_source_selected(self, source):
-        self._selected_source = source
+    def _on_source_selected(self, app_name):
+        self._selected_source_name = app_name
         self._try_auto_route()
 
     def _on_dest_selected(self, dest):
@@ -593,7 +702,7 @@ class SystemTrayApp:
 
     def _try_auto_route(self):
         """If both source and destination are selected, create the route."""
-        if self._selected_source is None or self._selected_dest is None:
+        if not getattr(self, '_selected_source_name', None) or self._selected_dest is None:
             return
 
         # Auto-create virtual sink if the destination is the virtual sink
@@ -608,27 +717,38 @@ class SystemTrayApp:
                     self._selected_dest = d
                     break
 
-        # Refresh source ports in case they changed (match by port IDs
-        # to handle duplicate node names like multiple Chromium streams)
-        for s in self.pw.list_audio_sources():
-            if self._same_node(s, self._selected_source):
-                self._selected_source = s
-                break
+        # Route ALL current streams matching this app name
+        sources = self.pw.list_audio_sources()
+        routed = False
+        for src_node in sources:
+            if src_node["name"] == self._selected_source_name:
+                self.pw.route_source_to_destination(src_node, self._selected_dest)
+                routed = True
 
-        self.pw.route_source_to_destination(
-            self._selected_source, self._selected_dest
+        # Register a sticky rule so new streams get auto-routed
+        self.pw.add_routing_rule(
+            self._selected_source_name, self._selected_dest
         )
 
-        self.tray.showMessage(
-            "Audio Routed",
-            f"{self._selected_source['name']} -> {self._selected_dest['name']}",
-            QSystemTrayIcon.MessageIcon.Information,
-            2000,
-        )
+        if routed:
+            self.tray.showMessage(
+                "Audio Routed",
+                f"{self._selected_source_name} -> {self._selected_dest['name']}",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000,
+            )
 
     @staticmethod
     def VIRTUAL_SINK_NAME_MATCH(name):
         return PipeWireManager.VIRTUAL_SINK_NAME.lower() in name.lower()
+
+    def _on_remove_link_group(self, link_group):
+        """Remove all channel links for a route and its routing rule."""
+        if link_group:
+            src_app = link_group[0]["src_name"].rsplit(":", 1)[0]
+            self.pw.remove_routing_rule(src_app)
+        for link in link_group:
+            self.pw.destroy_link(link)
 
     def _on_toggle_virtual_mic(self):
         if self.pw.virtual_mic_active:
@@ -637,11 +757,14 @@ class SystemTrayApp:
             self.pw.create_virtual_mic()
 
     def _on_stop_all(self):
+        self.pw.clear_routing_rules()
         self.pw.destroy_all_links()
-        self._selected_source = None
+        self._selected_source_name = None
         self._selected_dest = None
 
     def _on_quit(self):
+        self._enforce_timer.stop()
+        self.pw.clear_routing_rules()
         self.pw.destroy_all_links()
         self.pw.destroy_virtual_sink()
         self.pw.destroy_virtual_mic()
