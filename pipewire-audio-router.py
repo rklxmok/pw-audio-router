@@ -18,6 +18,7 @@ class PipeWireManager:
 
     def __init__(self):
         self._virtual_sink_id = None
+        self._tracked_ports = []  # list of (src_port_name, dst_port_name) we created
         # Check if we already have a virtual sink from a previous session
         self._detect_existing_virtual_sink()
 
@@ -167,12 +168,17 @@ class PipeWireManager:
                 ["pw-link", source_port_name, dest_port_name],
                 capture_output=True, text=True, timeout=5,
             )
-            return result.returncode == 0 or "already linked" in result.stderr
+            if result.returncode == 0 or "already linked" in result.stderr:
+                pair = (source_port_name, dest_port_name)
+                if pair not in self._tracked_ports:
+                    self._tracked_ports.append(pair)
+                return True
+            return False
         except subprocess.SubprocessError:
             return False
 
-    def destroy_link(self, link_id):
-        """Destroy a link by its PipeWire link ID."""
+    def destroy_link(self, link_id, src=None, dst=None):
+        """Destroy a link by its PipeWire link ID and remove from tracking."""
         try:
             subprocess.run(
                 ["pw-link", "-d", str(link_id)],
@@ -180,14 +186,19 @@ class PipeWireManager:
             )
         except subprocess.SubprocessError:
             pass
+        if src and dst and (src, dst) in self._tracked_ports:
+            self._tracked_ports.remove((src, dst))
 
     def destroy_all_links(self):
-        """Destroy all currently active links reported by PipeWire."""
+        """Destroy only the links we created."""
         for link in self.get_active_links():
-            self.destroy_link(link["link_id"])
+            self.destroy_link(link["link_id"], link["src"], link["dst"])
+        self._tracked_ports.clear()
 
     def get_active_links(self):
-        """Query PipeWire for all active links. Returns list of dicts with link_id, src, dst."""
+        """Query PipeWire for links we created. Returns list of dicts with link_id, src, dst."""
+        if not self._tracked_ports:
+            return []
         try:
             result = subprocess.run(
                 ["pw-link", "-l"],
@@ -200,11 +211,14 @@ class PipeWireManager:
         for line in result.stdout.splitlines():
             match = re.match(r'\s*(\d+)\s+(.+?)\s+->\s+(.+)', line)
             if match:
-                links.append({
-                    "link_id": match.group(1),
-                    "src": match.group(2).strip(),
-                    "dst": match.group(3).strip(),
-                })
+                src = match.group(2).strip()
+                dst = match.group(3).strip()
+                if (src, dst) in self._tracked_ports:
+                    links.append({
+                        "link_id": match.group(1),
+                        "src": src,
+                        "dst": dst,
+                    })
         return links
 
     def route_source_to_destination(self, source_node, dest_node):
