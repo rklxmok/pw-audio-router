@@ -177,13 +177,19 @@ class PipeWireManager:
         except subprocess.SubprocessError:
             return False
 
-    def destroy_link(self, link_id, src=None, dst=None):
-        """Destroy a link by its PipeWire link ID and remove from tracking."""
+    def destroy_link(self, link_id=None, src=None, dst=None):
+        """Destroy a link by ID if available, falling back to port names."""
         try:
-            subprocess.run(
-                ["pw-link", "-d", str(link_id)],
-                capture_output=True, text=True, timeout=5,
-            )
+            if link_id:
+                subprocess.run(
+                    ["pw-link", "-d", str(link_id)],
+                    capture_output=True, text=True, timeout=5,
+                )
+            elif src and dst:
+                subprocess.run(
+                    ["pw-link", "-d", src, dst],
+                    capture_output=True, text=True, timeout=5,
+                )
         except subprocess.SubprocessError:
             pass
         if src and dst and (src, dst) in self._tracked_ports:
@@ -196,30 +202,28 @@ class PipeWireManager:
         self._tracked_ports.clear()
 
     def get_active_links(self):
-        """Query PipeWire for links we created. Returns list of dicts with link_id, src, dst."""
+        """Return tracked links. Enriches with link IDs from pw-link -l where possible."""
         if not self._tracked_ports:
             return []
+
+        # Try to get link IDs from PipeWire for reliable deletion
+        id_lookup = {}
         try:
             result = subprocess.run(
                 ["pw-link", "-l"],
                 capture_output=True, text=True, timeout=5,
             )
+            for line in result.stdout.splitlines():
+                match = re.match(r'\s*(\d+)\s+(.+?)\s+->\s+(.+)', line)
+                if match:
+                    id_lookup[(match.group(2).strip(), match.group(3).strip())] = match.group(1)
         except subprocess.SubprocessError:
-            return []
+            pass
 
-        links = []
-        for line in result.stdout.splitlines():
-            match = re.match(r'\s*(\d+)\s+(.+?)\s+->\s+(.+)', line)
-            if match:
-                src = match.group(2).strip()
-                dst = match.group(3).strip()
-                if (src, dst) in self._tracked_ports:
-                    links.append({
-                        "link_id": match.group(1),
-                        "src": src,
-                        "dst": dst,
-                    })
-        return links
+        return [
+            {"link_id": id_lookup.get((src, dst)), "src": src, "dst": dst}
+            for src, dst in self._tracked_ports
+        ]
 
     def route_source_to_destination(self, source_node, dest_node):
         """Route all audio channels from source to destination.
